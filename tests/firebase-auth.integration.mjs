@@ -38,7 +38,7 @@ try{
  const migrationDir=new URL('../drizzle/',import.meta.url);
  const sql=fs.readdirSync(migrationDir).filter(name=>name.endsWith('.sql')).sort().map(name=>fs.readFileSync(new URL(name,migrationDir),'utf8')).join('\n--> statement-breakpoint\n');
  for(const s of sql.split('--> statement-breakpoint').map(s=>s.trim()).filter(Boolean))await db.prepare(s).run();
- const insecure=await mf.dispatchFetch('http://test.local/api/session');
+ const insecure=await mf.dispatchFetch('http://test.local/api/session',{redirect:'manual'});
  assert.equal(insecure.status,308);assert.equal(insecure.headers.get('location'),'https://test.local/api/session');checks++;
  const forged={'oai-authenticated-user-id':'attacker','oai-authenticated-user-email':ownerEmail};
  assert.equal((await call('session','GET',undefined,forged)).data.user,null);
