@@ -51,3 +51,10 @@ __pycache__/
 /results/
 noteatlas-activity*.csv
 /research-exports/
+
+# Owner-only documentation stays in this local checkout.
+/README.md
+/CODEX_HANDOFF.md
+/LOCAL_SETUP.md
+/FIREBASE_SETUP.md
+/ml/README.md
