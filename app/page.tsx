@@ -7,5 +7,6 @@ export const metadata:Metadata={
  title:'NoteAtlas — Your ideas, organized',
  description:'A private home for your notes. Capture ideas, organize them with folders and tags, attach files, and share read-only links when you choose.',
  robots:{index:true,follow:true},
+ alternates:{canonical:"https://noteatlas.fahim-notes.workers.dev/"},
 };
 export default function Home(){return <Workspace/>;}
