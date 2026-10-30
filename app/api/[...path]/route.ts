@@ -1,24 +1,68 @@
-import { getChatGPTUser } from "@/app/chatgpt-auth";
+import {handleProfile} from "@/lib/profile";
+import { currentUser, authMode, authCookie, isResearchOwner } from "@/lib/auth";
+import { verifyFirebaseToken } from "@/lib/firebase-token";
+import { normalizeTags } from "@/lib/note-organization";
 import { EXAMPLES } from "@/lib/examples";
 import { validateModel, FEATURES } from "@/lib/research-model";
-import { db,bucket,uid,now,HttpError,json,user,admin,sameOrigin,body,readBytes,text,oneOf,consentId,researchCookie,cleanup,participant,track,ownedNote,activity,analytics } from "@/lib/server";
+import { db,bucket,uid,now,decodeNote,HttpError,json,user,admin,sameOrigin,body,readBytes,text,oneOf,consentId,researchCookie,cleanup,participant,track,ownedNote,activity,analytics } from "@/lib/server";
 export const dynamic = "force-dynamic";
 const CATEGORIES=["Personal","Learning","Projects","Research"],COLORS=["cream","yellow","lavender","rose","mint","blue"];
 type Context={params:Promise<{path:string[]}>};
+async function organization(b:Record<string,unknown>,ownerId:string,fallback?:Record<string,any>){
+  const folderId=b.folderId===undefined?fallback?.folderId??null:b.folderId;
+  if(folderId!==null){if(typeof folderId!=="string")throw new HttpError(400,"Choose a valid folder.");const folder=await db().prepare("SELECT id FROM folders WHERE id=? AND ownerId=?").bind(folderId,ownerId).first();if(!folder)throw new HttpError(404,"Folder not found. Choose another folder or Unfiled.");}
+  let tags:string[];try{tags=normalizeTags(b.tags===undefined?fallback?.tags??[]:b.tags);}catch(e){throw new HttpError(400,(e as Error).message);}
+  return {folderId,tags:JSON.stringify(tags)};
+}
 async function handle(req:Request,context:Context):Promise<Response> {
   try {
     const {path}=await context.params; const [resource,id,action]=path; const method=req.method;
     if(method!=="GET")sameOrigin(req);
+    if(resource==="auth"&&id==="session"&&authMode()==="firebase") {
+      if(method==="DELETE")return json({ok:true},200,{"Set-Cookie":authCookie(req)});
+      if(method==="POST") {
+        const b=await body(req);
+        if(typeof b.token!=="string"||b.token.length>12000)throw new HttpError(400,"A Firebase ID token is required.");
+        let verified;
+        try { verified=await verifyFirebaseToken(b.token); }
+        catch { throw new HttpError(401,"Please sign in with a verified email address."); }
+        return json({ok:true},200,{"Set-Cookie":authCookie(req,b.token,verified.expiresAt)});
+      }
+    }
+    if(resource==="profile"&&!action)return await handleProfile(req,id);
     if(resource==="session"&&method==="GET") {
-      const u=await getChatGPTUser();
-      // New Sites are owner-private. The first signed-in owner initializes research ownership.
-      if(u)await db().prepare("INSERT OR IGNORE INTO settings (key,value) VALUES ('research_owner',?)").bind(u.userId).run();
-      const owner=await db().prepare("SELECT value FROM settings WHERE key='research_owner'").first<{value:string}>();
-      return json({user:u?{name:u.fullName||u.displayName,email:u.email}:null,isAdmin:!!u&&owner?.value===u.userId});
+      const u=await currentUser();
+      // The first-user bootstrap is only for the legacy owner-private Sites runtime.
+      if(u&&authMode()==="sites")await db().prepare("INSERT OR IGNORE INTO settings (key,value) VALUES ('research_owner',?)").bind(u.userId).run();
+      const profile=u?await db().prepare("SELECT photoVersion FROM profiles WHERE ownerId=?").bind(u.userId).first<{photoVersion:string|null}>():null;
+      return json({user:u?{name:u.fullName||u.displayName,email:u.email,photoVersion:profile?.photoVersion??null}:null,isAdmin:await isResearchOwner(u),authMode:authMode()});
+    }
+    if(resource==="folders") {
+      const u=await user();
+      if(!id&&method==="GET")return json({folders:(await db().prepare("SELECT id,name FROM folders WHERE ownerId=? ORDER BY name COLLATE NOCASE").bind(u.userId).all()).results});
+      if(id){const folder=await db().prepare("SELECT id FROM folders WHERE id=? AND ownerId=?").bind(id,u.userId).first();if(!folder)throw new HttpError(404,"Folder not found.");}
+      if((method==="POST"&&!id)||(method==="PATCH"&&id)){
+        const b=await body(req);const name=typeof b.name==="string"?b.name.trim():"";
+        if(!name||name.length>60||/[\r\n]/.test(name))throw new HttpError(400,"Folder names must be 1–60 characters without line breaks.");
+        if(!id){const count=await db().prepare("SELECT COUNT(*) n FROM folders WHERE ownerId=?").bind(u.userId).first<{n:number}>();if((count?.n??0)>=50)throw new HttpError(400,"Up to 50 folders per account.");}
+        const folderId=id??uid();
+        const result=id?await db().prepare("UPDATE OR IGNORE folders SET name=? WHERE id=? AND ownerId=?").bind(name,id,u.userId).run():await db().prepare("INSERT OR IGNORE INTO folders (id,ownerId,name,createdAt) SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM folders WHERE ownerId=?)<50").bind(folderId,u.userId,name,now(),u.userId).run();
+        if(!result.meta.changes)throw new HttpError(409,"A folder with that name already exists.");
+        return json({folder:{id:folderId,name}},id?200:201);
+      }
+      if(id&&method==="DELETE"){
+        const version=now();
+        await db().batch([
+          db().prepare("UPDATE notes SET folderId=NULL,updatedAt=CASE WHEN updatedAt>=? THEN strftime('%Y-%m-%dT%H:%M:%fZ',updatedAt,'+0.001 seconds') ELSE ? END WHERE folderId=? AND ownerId=?").bind(version,version,id,u.userId),
+          db().prepare("DELETE FROM folders WHERE id=? AND ownerId=?").bind(id,u.userId),
+        ]);
+        return json({ok:true});
+      }
+      throw new HttpError(404,"Endpoint not found.");
     }
     if(resource==="notes") {
       const u=await user();
-      if(!id&&method==="GET")return json({notes:(await db().prepare("SELECT n.*, (SELECT COUNT(*) FROM attachments a WHERE a.noteId=n.id) as attachmentCount FROM notes n WHERE ownerId=? ORDER BY updatedAt DESC").bind(u.userId).all()).results});
+      if(!id&&method==="GET"){const trash=new URL(req.url).searchParams.get("trash")==="1";return json({notes:(await db().prepare("SELECT n.*, (SELECT COUNT(*) FROM attachments a WHERE a.noteId=n.id) as attachmentCount FROM notes n WHERE ownerId=? AND ((?=1 AND deletedAt IS NOT NULL) OR (?=0 AND deletedAt IS NULL)) ORDER BY updatedAt DESC").bind(u.userId,trash?1:0,trash?1:0).all()).results.map(decodeNote)});}
       if(id==="starter"&&method==="POST") {
         const existing=await db().prepare("SELECT COUNT(*) as n FROM notes WHERE ownerId=?").bind(u.userId).first<{n:number}>();
         if((existing?.n||0)>0)throw new HttpError(409,"Example notes can be added to an empty workspace.");
@@ -26,15 +70,47 @@ async function handle(req:Request,context:Context):Promise<Response> {
         return json({ok:true});
       }
       if(!id&&method==="POST") {
-        const b=await body(req);const noteId=uid();const count=await db().prepare("SELECT COUNT(*) as n FROM notes WHERE ownerId=?").bind(u.userId).first<{n:number}>();
+        const b=await body(req);
+        if(b.clientId!==undefined&&(typeof b.clientId!=="string"||!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(b.clientId)))throw new HttpError(400,"Invalid note creation identifier.");
+        const noteId=b.clientId??uid();
+        if(b.clientId){const existing=await db().prepare("SELECT id FROM notes WHERE id=? AND ownerId=?").bind(noteId,u.userId).first();if(existing)return json({note:await ownedNote(noteId,u.userId)});}
+        const count=await db().prepare("SELECT COUNT(*) as n FROM notes WHERE ownerId=?").bind(u.userId).first<{n:number}>();
         if((count?.n||0)>=500)throw new HttpError(400,"This starter supports up to 500 notes per account.");
-        await db().prepare("INSERT INTO notes (id,ownerId,title,content,category,color,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?)").bind(noteId,u.userId,text(b.title,120)||"Untitled note",text(b.content,100000),oneOf(b.category,CATEGORIES,"Personal"),oneOf(b.color,COLORS,"cream"),now(),now()).run();
-        await track(req,"note_create");return json({note:await ownedNote(noteId,u.userId)},201);
+        const org=await organization(b,u.userId);
+        const inserted=await db().prepare("INSERT OR IGNORE INTO notes (id,ownerId,title,content,category,color,folderId,tags,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?,?)").bind(noteId,u.userId,text(b.title,120)||"Untitled note",typeof b.content==="string"?b.content.slice(0,100000):"",oneOf(b.category,CATEGORIES,"Personal"),oneOf(b.color,COLORS,"cream"),org.folderId,org.tags,now(),now()).run();
+        const note=await ownedNote(noteId,u.userId);
+        if(inserted.meta.changes)await track(req,"note_create");return json({note},inserted.meta.changes?201:200);
       }
-      const n=await ownedNote(id,u.userId);
+      const n=await ownedNote(id,u.userId,true);
+      if(action==="restore"&&method==="POST"){
+        if(!n.deletedAt)return json({note:n});
+        const b=await body(req),version=new Date(Math.max(Date.now(),Date.parse(n.updatedAt)+1)).toISOString();
+        const restored=await db().prepare("UPDATE notes SET deletedAt=NULL,updatedAt=? WHERE id=? AND ownerId=? AND deletedAt IS NOT NULL AND purgePending=0 AND updatedAt=? RETURNING *").bind(version,id,u.userId,b.expectedUpdatedAt??n.updatedAt).first<Record<string,any>>();
+        if(!restored)throw new HttpError(409,"This note changed or permanent deletion has started. Refresh Trash before continuing.");
+        return json({note:decodeNote(restored)});
+      }
+      if(action==="purge"&&method==="DELETE"){
+        if(!n.deletedAt)throw new HttpError(409,"Move this note to Trash before permanently deleting it.");
+        // Claim deletion before touching R2. Restore cannot race with cleanup.
+        const input=req.body?await body(req):{};
+        const claimed=await db().prepare("UPDATE notes SET purgePending=1 WHERE id=? AND ownerId=? AND deletedAt IS NOT NULL AND updatedAt=? RETURNING id").bind(id,u.userId,input.expectedUpdatedAt??n.updatedAt).first();
+        if(!claimed)throw new HttpError(409,"This note changed. Refresh Trash before deleting it.");
+        const files=(await db().prepare("SELECT storageKey FROM attachments WHERE noteId=?").bind(id).all<{storageKey:string}>()).results;
+        for(const file of files)await bucket().delete(file.storageKey);
+        await db().prepare("DELETE FROM notes WHERE id=? AND ownerId=? AND purgePending=1").bind(id,u.userId).run();return json({ok:true});
+      }
+      if((!action&&method==="DELETE")||(action==="trash"&&method==="POST")){
+        if(n.deletedAt)return json({ok:true});
+        const b=action==="trash"?await body(req):{},version=new Date(Math.max(Date.now(),Date.parse(n.updatedAt)+1)).toISOString();
+        const changed=await db().prepare("UPDATE notes SET deletedAt=?,shareToken=NULL,updatedAt=? WHERE id=? AND ownerId=? AND deletedAt IS NULL AND updatedAt=?").bind(now(),version,id,u.userId,b.expectedUpdatedAt??n.updatedAt).run();
+        if(!changed.meta.changes)throw new HttpError(409,"This note changed in another tab. Reload it before moving it to Trash.");
+        return json({ok:true});
+      }
+      if(n.deletedAt)throw new HttpError(404,"Note is in Trash. Restore it before editing or downloading attachments.");
+      if(action&&!["share","attachments"].includes(action))throw new HttpError(404,"Endpoint not found.");
       if(action==="share"&&method==="POST") {
         const b=await body(req);const token=b.enabled===false?null:n.shareToken||uid().replaceAll("-","");
-        await db().prepare("UPDATE notes SET shareToken=? WHERE id=? AND ownerId=?").bind(token,id,u.userId).run();
+        const shared=await db().prepare("UPDATE notes SET shareToken=? WHERE id=? AND ownerId=? AND deletedAt IS NULL").bind(token,id,u.userId).run();if(!shared.meta.changes)throw new HttpError(409,"This note moved to Trash. Refresh your notes.");
         if(token)await track(req,"share");return json({shareToken:token});
       }
       if(action==="attachments"&&method==="POST") {
@@ -50,25 +126,29 @@ async function handle(req:Request,context:Context):Promise<Response> {
         if((count?.n||0)>=10)throw new HttpError(400,"Up to 10 attachments per note.");
         const fileId=uid(),key=`notes/${u.userId}/${fileId}`;
         await bucket().put(key,await file.arrayBuffer(),{httpMetadata:{contentType:allowed[ext]}});
-        try{await db().prepare("INSERT INTO attachments (id,noteId,ownerId,filename,storageKey,mime,size,createdAt) VALUES (?,?,?,?,?,?,?,?)").bind(fileId,id,u.userId,text(file.name,180),key,allowed[ext],file.size,now()).run();}catch(e){await bucket().delete(key);throw e;}
+        try{const inserted=await db().prepare("INSERT INTO attachments (id,noteId,ownerId,filename,storageKey,mime,size,createdAt) SELECT ?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM notes WHERE id=? AND ownerId=? AND deletedAt IS NULL)").bind(fileId,id,u.userId,text(file.name,180),key,allowed[ext],file.size,now(),id,u.userId).run();if(!inserted.meta.changes)throw new HttpError(409,"This note moved to Trash. Restore it before attaching files.");}catch(e){await bucket().delete(key);throw e;}
         await track(req,"upload");return json({ok:true},201);
       }
       if(method==="GET")return json({note:n,attachments:(await db().prepare("SELECT id,filename,mime,size FROM attachments WHERE noteId=?").bind(id).all()).results});
       if(method==="PATCH") {
         const b=await body(req);
-        await db().prepare("UPDATE notes SET title=?,content=?,category=?,color=?,starred=?,updatedAt=? WHERE id=? AND ownerId=?").bind(text(b.title,120,n.title)||"Untitled note",b.content===undefined?n.content:text(b.content,100000),oneOf(b.category,CATEGORIES,n.category),oneOf(b.color,COLORS,n.color),b.starred===undefined?n.starred:b.starred?1:0,now(),id,u.userId).run();
-        await track(req,"note_edit");return json({note:await ownedNote(id,u.userId)});
+        const org=await organization(b,u.userId,n);
+        if(b.expectedUpdatedAt!==undefined&&typeof b.expectedUpdatedAt!=="string")throw new HttpError(400,"Invalid note version.");
+        const title=text(b.title,120,n.title)||"Untitled note",content=b.content===undefined?n.content:typeof b.content==="string"?b.content.slice(0,100000):"";
+        const category=oneOf(b.category,CATEGORIES,n.category),color=oneOf(b.color,COLORS,n.color),starred=b.starred===undefined?n.starred:b.starred?1:0;
+        // Retries of an already-applied save are harmless and don't inflate research.
+        if(title===n.title&&content===n.content&&category===n.category&&color===n.color&&starred===n.starred&&org.folderId===n.folderId&&org.tags===JSON.stringify(n.tags))return json({note:n});
+        const version=new Date(Math.max(Date.now(),Date.parse(n.updatedAt)+1)).toISOString();
+        const updated=await db().prepare("UPDATE notes SET title=?,content=?,category=?,color=?,starred=?,folderId=?,tags=?,updatedAt=? WHERE id=? AND ownerId=? AND updatedAt=? AND deletedAt IS NULL RETURNING *").bind(title,content,category,color,starred,org.folderId,org.tags,version,id,u.userId,b.expectedUpdatedAt??n.updatedAt).first<Record<string,any>>();
+        if(!updated)throw new HttpError(409,"This note changed in another tab. Download your draft, then reload the saved version before editing.");
+        await track(req,"note_edit");return json({note:decodeNote(updated)});
       }
-      if(method==="DELETE") {
-        const files=(await db().prepare("SELECT storageKey FROM attachments WHERE noteId=?").bind(id).all<{storageKey:string}>()).results;
-        for(const f of files)await bucket().delete(f.storageKey);
-        await db().prepare("DELETE FROM notes WHERE id=? AND ownerId=?").bind(id,u.userId).run();return json({ok:true});
-      }
+
     }
     if(resource==="files"&&id) {
-      const f=await db().prepare("SELECT a.*,n.shareToken FROM attachments a JOIN notes n ON n.id=a.noteId WHERE a.id=?").bind(id).first<Record<string,any>>();
-      if(!f)throw new HttpError(404,"Attachment not found.");
-      const u=await getChatGPTUser();const token=new URL(req.url).searchParams.get("share");
+      const f=await db().prepare("SELECT a.*,n.shareToken,n.deletedAt FROM attachments a JOIN notes n ON n.id=a.noteId WHERE a.id=?").bind(id).first<Record<string,any>>();
+      if(!f||f.deletedAt)throw new HttpError(404,"Attachment not found.");
+      const u=await currentUser();const token=new URL(req.url).searchParams.get("share");
       const allowed=u?.userId===f.ownerId || (!!token && f.shareToken===token);
       if(method==="GET") {
         if(!allowed)throw new HttpError(404,"Attachment not found.");const object=await bucket().get(f.storageKey);if(!object)throw new HttpError(404,"Attachment not found.");
@@ -78,7 +158,7 @@ async function handle(req:Request,context:Context):Promise<Response> {
       if(method==="DELETE") {if(u?.userId!==f.ownerId)throw new HttpError(403,"Only the note owner can delete an attachment.");await bucket().delete(f.storageKey);await db().prepare("DELETE FROM attachments WHERE id=?").bind(id).run();return json({ok:true});}
     }
     if(resource==="shared"&&id&&method==="GET") {
-      const note=await db().prepare("SELECT id,title,content,category,color,updatedAt FROM notes WHERE shareToken=?").bind(id).first();if(!note)throw new HttpError(404,"This note is unavailable or its link was revoked.");
+      const note=await db().prepare("SELECT id,title,content,category,color,updatedAt FROM notes WHERE shareToken=? AND deletedAt IS NULL").bind(id).first();if(!note)throw new HttpError(404,"This note is unavailable or its link was revoked.");
       const attachments=(await db().prepare("SELECT id,filename,mime,size FROM attachments WHERE noteId=?").bind((note as {id:string}).id).all()).results;return json({note,attachments});
     }
     if(resource==="research") {

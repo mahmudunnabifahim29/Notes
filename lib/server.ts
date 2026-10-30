@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { getChatGPTUser } from "@/app/chatgpt-auth";
+import { currentUser, isResearchOwner } from "./auth";
 import { FEATURES, predictCluster, type Activity, type ResearchModel } from "./research-model";
 export function db() { if (!env.DB) throw new Error("Database unavailable."); return env.DB; }
 export function bucket() { if (!env.BUCKET) throw new Error("File storage unavailable."); return env.BUCKET; }
@@ -7,8 +7,8 @@ export const uid = () => crypto.randomUUID();
 export const now = () => new Date().toISOString();
 export class HttpError extends Error { constructor(public status:number, message:string) { super(message); } }
 export function json(data:unknown, status=200, headers:HeadersInit={}) { return Response.json(data, {status,headers:{"Cache-Control":"no-store",...headers}}); }
-export async function user() { const u=await getChatGPTUser(); if(!u) throw new HttpError(401,"Sign in with ChatGPT to save your notes."); return u; }
-export async function admin() { const u=await user(); const s=await db().prepare("SELECT value FROM settings WHERE key='research_owner'").first<{value:string}>(); if(s?.value!==u.userId) throw new HttpError(403,"Only the research owner can view this dashboard."); return u; }
+export async function user() { const u=await currentUser(); if(!u) throw new HttpError(401,"Sign in to save your notes."); return u; }
+export async function admin() { const u=await user(); if(!await isResearchOwner(u)) throw new HttpError(403,"Only the research owner can view this dashboard."); return u; }
 export function sameOrigin(req:Request) { const origin=req.headers.get("origin"); if(req.headers.get("sec-fetch-site")==="cross-site" || (origin && new URL(origin).host !== new URL(req.url).host && new URL(origin).host !== req.headers.get("host"))) throw new HttpError(403,"This action must come from this website."); }
 export async function readBytes(req:Request, limit:number) {
   if(Number(req.headers.get("content-length")||0)>limit)throw new HttpError(413,"Request is too large.");
@@ -28,7 +28,8 @@ export function researchCookie(req:Request,id:string,clear=false) { return `na_r
 export async function cleanup() { const date=new Date(Date.now()-90*86400000).toISOString(); await db().batch([db().prepare("DELETE FROM events WHERE createdAt < ?").bind(date),db().prepare("DELETE FROM participants WHERE createdAt < ?").bind(date)]); }
 export async function participant(req:Request) { const id=consentId(req); if(!id)return null; return db().prepare("SELECT * FROM participants WHERE id=? AND createdAt>=?").bind(id,new Date(Date.now()-90*86400000).toISOString()).first<Record<string,string|number>>(); }
 export async function track(req:Request,kind:string,seconds=0) { const p=await participant(req); if(!p)return; const recent=await db().prepare("SELECT COUNT(*) as n FROM events WHERE participantId=? AND createdAt>?").bind(p.id,new Date(Date.now()-3600000).toISOString()).first<{n:number}>(); if((recent?.n||0)>=180)return; await db().batch([db().prepare("INSERT INTO events (id,participantId,kind,seconds,createdAt) VALUES (?,?,?,?,?)").bind(uid(),p.id,kind,seconds,now()),db().prepare("UPDATE participants SET lastSeen=? WHERE id=?").bind(now(),p.id)]); }
-export async function ownedNote(id:string,ownerId:string) { const note=await db().prepare("SELECT * FROM notes WHERE id=? AND ownerId=?").bind(id,ownerId).first<Record<string,any>>(); if(!note)throw new HttpError(404,"Note not found."); return note; }
+export function decodeNote(note:Record<string,any>):Record<string,any>&{tags:string[];folderId:string|null} { return {...note,tags:typeof note.tags==="string"?JSON.parse(note.tags):note.tags??[],folderId:note.folderId??null}; }
+export async function ownedNote(id:string,ownerId:string,includeTrash=false) { const note=await db().prepare("SELECT * FROM notes WHERE id=? AND ownerId=?").bind(id,ownerId).first<Record<string,any>>(); if(!note||(!includeTrash&&note.deletedAt))throw new HttpError(404,"Note not found."); return decodeNote(note); }
 export async function activity():Promise<Activity[]> {
   const from=new Date(Date.now()-30*86400000).toISOString();
   const result=await db().prepare(`SELECT p.id as research_id,

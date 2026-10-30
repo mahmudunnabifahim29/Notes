@@ -1,6 +1,7 @@
 "use client";
 import { useEffect,useRef,type ReactNode } from "react";
-export async function api<T=any>(path:string,method="GET",payload?:unknown):Promise<T>{const r=await fetch(`/api/${path}`,{method,headers:payload instanceof FormData||payload===undefined?{}:{"Content-Type":"application/json"},body:payload===undefined?undefined:payload instanceof FormData?payload:JSON.stringify(payload)});const d:any=await r.json();if(!r.ok)throw new Error(d.error||"Something went wrong.");return d;}
+export class ApiError extends Error { constructor(message:string,public status:number){super(message);this.name="ApiError";} }
+export async function api<T=any>(path:string,method="GET",payload?:unknown):Promise<T>{const r=await fetch(`/api/${path}`,{method,headers:payload instanceof FormData||payload===undefined?{}:{"Content-Type":"application/json"},body:payload===undefined?undefined:payload instanceof FormData?payload:JSON.stringify(payload)});const d:any=await r.json();if(!r.ok)throw new ApiError(d.error||"Something went wrong.",r.status);return d;}
 export function Modal({children,onClose,wide=false,title}:{children:ReactNode;onClose:()=>void;wide?:boolean;title:string}){
  const box=useRef<HTMLDivElement>(null);
  useEffect(()=>{const before=document.activeElement as HTMLElement|null;const old=document.body.style.overflow;document.body.style.overflow="hidden";box.current?.focus();return()=>{document.body.style.overflow=old;before?.focus();};},[]);

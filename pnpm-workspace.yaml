@@ -4,6 +4,8 @@ minimumReleaseAgeIgnoreMissingTime: false
 trustLockfile: false
 strictDepBuilds: true
 allowBuilds:
+  '@firebase/util': true
+  protobufjs: false
   esbuild: true
   fsevents: true
   sharp: true

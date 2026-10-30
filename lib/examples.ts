@@ -1,4 +1,4 @@
-export type Note = { id:string; title:string; content:string; category:string; color:string; starred:number; shareToken:string|null; createdAt:string; updatedAt:string; attachmentCount?:number };
+export type Note = { id:string; title:string; content:string; category:string; color:string; starred:number; shareToken:string|null; createdAt:string; updatedAt:string; deletedAt?:string|null; purgePending?:number; folderId?:string|null; tags?:string[]; attachmentCount?:number };
 const date = "2026-10-28T09:00:00.000Z";
 export const EXAMPLES: Note[] = [
   { id:"example-1", title:"Small steps, big ideas", category:"Personal", color:"yellow", starred:1, content:"A place for the things I don’t want to forget.\n\n→ Capture an idea while it’s fresh\n→ Make room for a little curiosity\n→ Share something useful with someone\n\nProgress starts with one good note.", shareToken:null, createdAt:date, updatedAt:date },

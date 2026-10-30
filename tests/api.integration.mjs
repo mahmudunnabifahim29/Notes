@@ -6,7 +6,7 @@ const require=createRequire(fs.realpathSync(new URL('../node_modules/wrangler/pa
 const {Miniflare}=require('miniflare');
 const base=new URL('../dist/server/',import.meta.url).pathname;
 const files=fs.readdirSync(base,{recursive:true}).filter(p=>p.endsWith('.js')).map(p=>({type:'ESModule',path:base+p}));
-const mf=new Miniflare({modules:[{type:'ESModule',path:base+'index.js'},...files.filter(p=>p.path!==base+'index.js')],compatibilityDate:'2026-05-15',compatibilityFlags:['nodejs_compat'],d1Databases:['DB'],r2Buckets:['BUCKET'],cf:false});
+const mf=new Miniflare({modules:[{type:'ESModule',path:base+'index.js'},...files.filter(p=>p.path!==base+'index.js')],compatibilityDate:'2026-05-15',compatibilityFlags:['nodejs_compat'],d1Databases:['DB'],r2Buckets:['BUCKET'],cf:false,bindings:{AUTH_MODE:'sites'}});
 const identity=id=>({'oai-authenticated-user-id':id,'oai-authenticated-user-email':`${id}@example.test`});
 let checks=0;
 async function call(path,method='GET',payload,headers={},status=200){
@@ -21,19 +21,75 @@ async function call(path,method='GET',payload,headers={},status=200){
 }
 try{
  const db=await mf.getD1Database('DB');const bucket=await mf.getR2Bucket('BUCKET');
- const sql=fs.readFileSync(new URL('../drizzle/0000_stiff_beyonder.sql',import.meta.url),'utf8');
- for(const s of sql.split('--> statement-breakpoint').map(s=>s.trim()).filter(Boolean))await db.prepare(s).run();
+ const migrationDir=new URL('../drizzle/',import.meta.url);
+ for(const name of fs.readdirSync(migrationDir).filter(name=>name.endsWith('.sql')).sort()){
+  if(name.startsWith('0001_'))await db.prepare("INSERT INTO notes (id,ownerId,title,content,createdAt,updatedAt) VALUES ('legacy-note','legacy-owner','Kept title','Kept content','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')").run();
+  const sql=fs.readFileSync(new URL(name,migrationDir),'utf8');
+  for(const statement of sql.split('--> statement-breakpoint').map(s=>s.trim()).filter(Boolean))await db.prepare(statement).run();
+ }
+ const legacy=await db.prepare("SELECT * FROM notes WHERE id='legacy-note'").first();
+ assert.equal(legacy.content,'Kept content');assert.equal(legacy.folderId,null);assert.equal(legacy.tags,'[]');assert.equal(legacy.deletedAt,null);assert.equal(legacy.purgePending,0);checks++;
+ await db.prepare("DELETE FROM notes WHERE id='legacy-note'").run();
  assert.equal((await call('session')).data.user,null);
  await call('notes','POST',{title:'No identity'},{},401);
  await call('research/event','POST',{kind:'page_view'});
  assert.equal((await db.prepare('SELECT COUNT(*) n FROM events').first()).n,0,'No tracking before consent');checks++;
  const a=identity('qa-owner'),b=identity('qa-other');
+ await call('profile','GET',undefined,{},401);
+ await call('profile/photo','GET',undefined,{},401);
+ const emptyProfile=(await call('profile','GET',undefined,a)).data.profile;
+ assert.equal(emptyProfile.phone,'');assert.equal(emptyProfile.photoVersion,null);checks++;
+ const accountProfile=(await call('profile','PATCH',{phone:'+880 1700 000000',addressLine1:'Private address sentinel',city:'Dhaka',country:'Bangladesh',organization:'Private institution sentinel',jobTitle:'Student',website:'https://example.test',bio:'Private bio sentinel',expectedUpdatedAt:emptyProfile.updatedAt},a)).data.profile;
+ assert.equal(accountProfile.addressLine1,'Private address sentinel');checks++;
+ await call('profile','PATCH',{phone:'stale',expectedUpdatedAt:emptyProfile.updatedAt},a,400);
+ await call('profile','PATCH',{bio:'Stale overwrite',expectedUpdatedAt:emptyProfile.updatedAt},a,409);
+ await call('profile','PATCH',{ownerId:'qa-other',expectedUpdatedAt:accountProfile.updatedAt},a,400);
+ await call('profile','PATCH',{email:'owner@example.test',expectedUpdatedAt:accountProfile.updatedAt},a,400);
+ await call('profile','PATCH',{website:'javascript:alert(1)',expectedUpdatedAt:accountProfile.updatedAt},a,400);
+ await call('profile','PATCH',{bio:'x'.repeat(501),expectedUpdatedAt:accountProfile.updatedAt},a,400);
+ assert.equal((await call('profile','GET',undefined,b)).data.profile.addressLine1,'');checks++;
+ await call('profile/qa-owner','GET',undefined,b,404);
+ const badPhoto=new FormData();badPhoto.append('file',new File(['<svg onload="alert(1)"></svg>'],'fake.png',{type:'image/png'}));
+ await call('profile/photo','POST',badPhoto,a,400);
+ const picture=()=>{const form=new FormData();form.append('file',new File([Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64')],'avatar.png',{type:'image/png'}));return form;};
+ await call('profile/photo','POST',picture(),a);
+ const firstPhoto=await db.prepare('SELECT photoKey FROM profiles WHERE ownerId=?').bind('qa-owner').first();
+ assert.equal((await call('profile/photo','GET',undefined,a)).response.headers.get('content-type'),'image/png');checks++;
+ await call('profile/photo','GET',undefined,b,404);
+ await call('profile/photo','GET',undefined,{},401);
+ await call('profile/photo','POST',picture(),a);
+ assert.equal(await bucket.get(firstPhoto.photoKey),null,'Replacing a picture deletes the old object');checks++;
+ const secondPhoto=await db.prepare('SELECT photoKey FROM profiles WHERE ownerId=?').bind('qa-owner').first();
+ await call('profile/photo','DELETE',undefined,a);
+ assert.equal(await bucket.get(secondPhoto.photoKey),null,'Removing a picture deletes its object');checks++;
+ await call('profile/photo','GET',undefined,a,404);
+ assert.equal((await db.prepare('SELECT COUNT(*) n FROM participants').first()).n,0,'Account profiles do not create research participants');checks++;
+
  assert.equal((await call('session','GET',undefined,a)).data.isAdmin,true);
  assert.equal((await call('session','GET',undefined,b)).data.isAdmin,false);
  await call('notes','POST',null,a,400);
  const created=(await call('notes','POST',{title:'Integration note',content:'Private sample text',category:'Research'},a,201)).data.note;
  await call(`notes/${created.id}`,'PATCH',{content:'Edited private sample',starred:true},a);
  assert.equal((await call(`notes/${created.id}`,'GET',undefined,a)).data.note.content,'Edited private sample');
+ // Two editors start with the same version: exactly one concurrent write wins.
+ const baseVersion=(await call(`notes/${created.id}`,'GET',undefined,a)).data.note.updatedAt;
+ const competing=await Promise.all(['Tab one','Tab two'].map(content=>mf.dispatchFetch(`https://test.local/api/notes/${created.id}`,{method:'PATCH',headers:{...a,'Content-Type':'application/json'},body:JSON.stringify({content,expectedUpdatedAt:baseVersion})})));
+ assert.deepEqual(competing.map(r=>r.status).sort(),[200,409]);checks++;
+ const winner=(await call(`notes/${created.id}`,'GET',undefined,a)).data.note;
+ assert.ok(winner.updatedAt>baseVersion,'Versions advance even for rapid writes');checks++;
+ await call(`notes/${created.id}`,'PATCH',{content:'Stale overwrite',expectedUpdatedAt:baseVersion},a,409);
+ const retry=(await call(`notes/${created.id}`,'PATCH',{content:winner.content,expectedUpdatedAt:baseVersion},a)).data.note;
+ assert.equal(retry.updatedAt,winner.updatedAt,'Already-applied retries do not advance versions');checks++;
+ await call(`notes/${created.id}`,'PATCH',{content:'Edited private sample',expectedUpdatedAt:winner.updatedAt},a);
+ const clientId=crypto.randomUUID();
+ const whitespace='  indented text\n\n';
+ const firstCreate=(await call('notes','POST',{clientId,title:'Retry-safe note',content:whitespace},a,201)).data.note;
+ const repeatCreate=(await call('notes','POST',{clientId,title:'Different retry',content:'must not replace existing text'},a)).data.note;
+ assert.equal(repeatCreate.id,firstCreate.id);assert.equal(repeatCreate.content,whitespace);checks++;
+ await call('notes','POST',{clientId,title:'Wrong owner'},b,404);
+ await call('notes','POST',{clientId:'not-a-uuid'},a,400);
+ await call(`notes/${clientId}`,'DELETE',undefined,a);
+
  assert.equal((await call('notes','GET',undefined,b)).data.notes.length,0);
  for(const [method,payload] of [['GET',undefined],['PATCH',{title:'Wrong owner'}],['DELETE',undefined]])await call(`notes/${created.id}`,method,payload,b,404);
  await call(`notes/${created.id}/share`,'POST',{enabled:true},b,404);
@@ -48,8 +104,35 @@ try{
  assert.equal((await call(`files/${file.id}`,'GET',undefined,a)).data,'A small test attachment');
  const invalid=new FormData();invalid.append('file',new File(['<html>'],'unsafe.html'));
  await call(`notes/${created.id}/attachments`,'POST',invalid,a,400);
+ // Folder/tag ownership, validation, and privacy are separate from research.
+ await call('folders','GET',undefined,{},401);
+ const folder=(await call('folders','POST',{name:'Private course folder'},a,201)).data.folder;
+ const otherFolder=(await call('folders','POST',{name:'Private course folder'},b,201)).data.folder;
+ await call('folders','POST',{name:'Private course folder'},a,409);
+ await call('folders','POST',{name:'   '},a,400);
+ await call('folders','POST',{name:'x'.repeat(61)},a,400);
+ assert.deepEqual((await call('folders','GET',undefined,a)).data.folders,[folder]);checks++;
+ for(const method of ['GET','PATCH','DELETE'])await call(`folders/${folder.id}`,method,method==='PATCH'?{name:'Stolen'}:undefined,b,404);
+ await call(`folders/${folder.id}`,'PATCH',{name:'Renamed private folder'},a);
+ await call(`notes/${created.id}`,'PATCH',{folderId:otherFolder.id},a,404);
+ await call('notes','POST',{title:'Wrong folder',folderId:otherFolder.id},a,404);
+ await call(`notes/${created.id}`,'PATCH',{tags:'invalid'},a,400);
+ await call(`notes/${created.id}`,'PATCH',{tags:Array.from({length:11},(_,i)=>`tag${i}`)},a,400);
+ await call(`notes/${created.id}`,'PATCH',{tags:['x'.repeat(25)]},a,400);
+ const organized=(await call(`notes/${created.id}`,'PATCH',{folderId:folder.id,tags:['  Study  ','study','Important']},a)).data.note;
+ assert.deepEqual(organized.tags,['study','important']);assert.equal(organized.folderId,folder.id);checks++;
+ assert.deepEqual((await call('notes','GET',undefined,a)).data.notes[0].tags,['study','important']);checks++;
  const token=(await call(`notes/${created.id}/share`,'POST',{enabled:true},a)).data.shareToken;
  assert.equal((await call(`shared/${token}`)).data.note.content,'Edited private sample');
+ const shared=(await call(`shared/${token}`)).data.note;
+ assert.ok(!('tags' in shared)&&!('folderId' in shared),'Private organization is omitted from sharing');checks++;
+ await call(`folders/${folder.id}`,'DELETE',undefined,a);
+ const unfiled=(await call(`notes/${created.id}`,'GET',undefined,a)).data;
+ assert.equal(unfiled.note.folderId,null);assert.deepEqual(unfiled.note.tags,['study','important']);assert.equal(unfiled.attachments.length,1);checks++;
+ assert.ok(unfiled.note.updatedAt>organized.updatedAt,'Folder removal invalidates stale editor versions');checks++;
+ await call(`notes/${created.id}`,'PATCH',{content:'Stale folder edit',expectedUpdatedAt:organized.updatedAt},a,409);
+ assert.equal((await call(`shared/${token}`)).data.note.content,'Edited private sample');
+
  await call(`files/${file.id}?share=incorrect`,'GET',undefined,{},404);
  assert.equal((await call(`files/${file.id}?share=${token}`)).data,'A small test attachment');
  await call(`notes/${created.id}/share`,'POST',{enabled:false},a);
@@ -65,11 +148,19 @@ try{
  await call('research/event','POST',{kind:'page_view'},research);
  await call('research/event','POST',{kind:'time_spent',seconds:30},research);
  await call('research/event','POST',{kind:'note_create'},research,400);
+ const beforeAutosave=(await call(`notes/${created.id}`,'GET',undefined,a)).data.note;
+ const autosaveHeaders={...a,...research};
+ const savedOnce=(await call(`notes/${created.id}`,'PATCH',{title:'Autosaved title',expectedUpdatedAt:beforeAutosave.updatedAt},autosaveHeaders)).data.note;
+ await call(`notes/${created.id}`,'PATCH',{title:'Autosaved title',expectedUpdatedAt:beforeAutosave.updatedAt},autosaveHeaders);
+ await call(`notes/${created.id}`,'PATCH',{title:'Stale title',expectedUpdatedAt:beforeAutosave.updatedAt},autosaveHeaders,409);
+ assert.equal((await db.prepare("SELECT COUNT(*) n FROM events WHERE kind='note_edit'").first()).n,1,'No-op retries and conflicts are not counted as edits');checks++;
+ assert.equal((await call(`notes/${created.id}`,'GET',undefined,a)).data.note.updatedAt,savedOnce.updatedAt);checks++;
+
  const stats=(await call('research/analytics','GET',undefined,a)).data;
  assert.equal(stats.browsers,1);assert.equal(stats.surveys,1);assert.equal(stats.pageViews,1);
  assert.deepEqual(stats.gender,[{label:'Small groups (combined)',count:1}]);checks++;
  const csv=(await call('research/export','GET',undefined,a)).data;
- assert.match(csv,/research_id,page_views,note_views,creates/);assert.ok(!csv.includes('Man')&&!csv.includes('Undergraduate')&&!csv.includes('@example.test')&&!csv.includes('Private sample'));checks++;
+ assert.match(csv,/research_id,page_views,note_views,creates/);assert.ok(!csv.includes('Man')&&!csv.includes('Undergraduate')&&!csv.includes('@example.test')&&!csv.includes('Private sample')&&!csv.includes('Private address sentinel')&&!csv.includes('Private institution sentinel')&&!csv.includes('+880'));checks++;
  await call('research/analytics','GET',undefined,b,403);
  await call('research/export','GET',undefined,b,403);
  await call('research/model','POST',{},b,403);
@@ -81,12 +172,40 @@ try{
  await call('research','POST',{consent:true,adult:true,survey:false},research);
  const off=(await call('research','GET',undefined,research)).data.profile;
  assert.equal(off.gender,'Unknown');assert.equal(off.surveyed,0,'Disabling the survey clears answers');checks++;
+ const beforeClear=(await call('profile','GET',undefined,a)).data.profile;
+ const cleared=(await call('profile','PATCH',{phone:'',addressLine1:'',addressLine2:'',city:'',region:'',postalCode:'',country:'',organization:'',jobTitle:'',website:'',bio:'',expectedUpdatedAt:beforeClear.updatedAt},a)).data.profile;
+ assert.equal(cleared.phone,'');assert.equal(cleared.addressLine1,'');checks++;
+ assert.equal((await call('research','GET',undefined,research)).data.consented,true,'Clearing profile details does not withdraw research');checks++;
  await call('research','DELETE',undefined,research);
  assert.equal((await call('research','GET',undefined,research)).data.consented,false);
  assert.equal((await db.prepare('SELECT COUNT(*) n FROM events').first()).n,0,'Withdrawal cascades to events');checks++;
- await call(`notes/${created.id}`,'DELETE',undefined,a);
+ await call(`notes/${created.id}/purge`,'DELETE',undefined,a,409);
+ const beforeTrash=(await call(`notes/${created.id}`,'GET',undefined,a)).data.note;
+ await call(`notes/${created.id}/trash`,'POST',{expectedUpdatedAt:'stale-version'},a,409);
+ await call(`notes/${created.id}/trash`,'POST',{expectedUpdatedAt:beforeTrash.updatedAt},a);
+ await call(`notes/${created.id}`,'DELETE',undefined,a); // Retry is idempotent, never a hard delete.
+ await call(`notes/${created.id}`,'GET',undefined,a,404);
+ await call(`notes/${created.id}`,'PATCH',{content:'Edit in trash'},a,404);
+ await call(`files/${file.id}`,'GET',undefined,a,404);
+ await call(`files/${file.id}?share=${token2}`,'GET',undefined,{},404);
+ await call(`shared/${token2}`,'GET',undefined,{},404);
+ assert.equal((await call('notes','GET',undefined,a)).data.notes.length,0);checks++;
+ const trashed=(await call('notes?trash=1','GET',undefined,a)).data.notes.find(note=>note.id===created.id);
+ assert.ok(trashed.deletedAt);assert.equal(trashed.shareToken,null);assert.ok(await bucket.get(stored.storageKey),'Trash retains attachments');checks++;
+ assert.equal((await call('notes?trash=1','GET',undefined,b)).data.notes.length,0);checks++;
+ await call(`notes/${created.id}/restore`,'POST',{},b,404);
+ await call(`notes/${created.id}/purge`,'DELETE',undefined,b,404);
+ const restored=(await call(`notes/${created.id}/restore`,'POST',{expectedUpdatedAt:trashed.updatedAt},a)).data.note;
+ assert.equal(restored.deletedAt,null);assert.equal(restored.shareToken,null);assert.deepEqual(restored.tags,['study','important']);checks++;
+ await call(`files/${file.id}`,'GET',undefined,a);
+ await call(`shared/${token2}`,'GET',undefined,{},404);
+ await call(`notes/${created.id}/trash`,'POST',{expectedUpdatedAt:restored.updatedAt},a);
+ // An interrupted purge can be retried but never restored after cleanup starts.
+ await db.prepare('UPDATE notes SET purgePending=1 WHERE id=?').bind(created.id).run();
+ await call(`notes/${created.id}/restore`,'POST',{},a,409);
+ await call(`notes/${created.id}/purge`,'DELETE',undefined,a);
  assert.equal((await db.prepare('SELECT COUNT(*) n FROM attachments').first()).n,0);
- assert.equal(await bucket.get(stored.storageKey),null,'Deleting a note removes its R2 object');checks++;
+ assert.equal(await bucket.get(stored.storageKey),null,'Permanent deletion removes the R2 object');checks++;
  await call(`shared/${token2}`,'GET',undefined,{},404);
  const expired=crypto.randomUUID(),old=new Date(Date.now()-91*86400000).toISOString();
  await db.prepare('INSERT INTO participants (id,consentVersion,device,language,createdAt,lastSeen) VALUES (?,?,?,?,?,?)').bind(expired,'test','Unknown','Unknown',old,old).run();

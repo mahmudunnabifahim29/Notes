@@ -1,9 +1,16 @@
-import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index, uniqueIndex } from "drizzle-orm/sqlite-core";
 export const settings = sqliteTable("settings", { key: text("key").primaryKey(), value: text("value").notNull() });
+export const folders = sqliteTable("folders", {
+  id: text("id").primaryKey(), ownerId: text("ownerId").notNull(), name: text("name").notNull(),
+  createdAt: text("createdAt").notNull(),
+}, t => [uniqueIndex("folders_owner_name").on(t.ownerId, t.name)]);
 export const notes = sqliteTable("notes", {
   id: text("id").primaryKey(), ownerId: text("ownerId").notNull(), title: text("title").notNull(),
   content: text("content").notNull().default(""), category: text("category").notNull().default("Personal"),
   color: text("color").notNull().default("cream"), starred: integer("starred").notNull().default(0),
+  folderId: text("folderId").references(() => folders.id, { onDelete: "set null" }),
+  tags: text("tags").notNull().default("[]"),
+  deletedAt: text("deletedAt"), purgePending: integer("purgePending").notNull().default(0),
   shareToken: text("shareToken").unique(), createdAt: text("createdAt").notNull(), updatedAt: text("updatedAt").notNull(),
 }, t => [index("notes_owner").on(t.ownerId)]);
 export const attachments = sqliteTable("attachments", {
@@ -23,3 +30,15 @@ export const events = sqliteTable("events", {
   id: text("id").primaryKey(), participantId: text("participantId").notNull().references(() => participants.id, { onDelete: "cascade" }),
   kind: text("kind").notNull(), seconds: integer("seconds").notNull().default(0), createdAt: text("createdAt").notNull(),
 }, t => [index("events_participant").on(t.participantId), index("events_date").on(t.createdAt)]);
+
+// Account details are never joined to optional research participant records.
+export const profiles = sqliteTable("profiles", {
+ ownerId: text("ownerId").primaryKey(), phone: text("phone").notNull().default(""),
+ addressLine1: text("addressLine1").notNull().default(""), addressLine2: text("addressLine2").notNull().default(""),
+ city: text("city").notNull().default(""), region: text("region").notNull().default(""),
+ postalCode: text("postalCode").notNull().default(""), country: text("country").notNull().default(""),
+ organization: text("organization").notNull().default(""), jobTitle: text("jobTitle").notNull().default(""),
+ website: text("website").notNull().default(""), bio: text("bio").notNull().default(""),
+ photoKey: text("photoKey"), photoMime: text("photoMime"), photoVersion: text("photoVersion"),
+ updatedAt: text("updatedAt").notNull(),
+});

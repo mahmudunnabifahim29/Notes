@@ -17,6 +17,10 @@ const managedLinux = readExecutionProfile() === "managed-linux";
 
 const localBindingConfig = {
   main: "./worker/index.ts",
+  vars: {
+    AUTH_MODE: "firebase",
+    RESEARCH_OWNER_EMAIL: "mahmudunnabifahim3579@gmail.com",
+  },
   compatibility_flags: ["nodejs_compat"],
   d1_databases: d1
     ? [
@@ -54,7 +58,7 @@ export default defineConfig(async ({ command }) => {
     },
     plugins: [
       vinext(),
-      sites({ mockAuth: !managedLinux }),
+      sites({ mockAuth: false }),
       connectorPreview(),
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
