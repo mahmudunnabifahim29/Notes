@@ -1,8 +1,9 @@
+import {D1FileStore} from "./d1-file-store";
 import { env } from "cloudflare:workers";
 import { currentUser, isResearchOwner } from "./auth";
 import { FEATURES, predictCluster, type Activity, type ResearchModel } from "./research-model";
 export function db() { if (!env.DB) throw new Error("Database unavailable."); return env.DB; }
-export function bucket() { if (!env.BUCKET) throw new Error("File storage unavailable."); return env.BUCKET; }
+export function bucket() { if(env.FILE_STORAGE==="d1")return new D1FileStore(db()); if (!env.BUCKET) throw new Error("File storage unavailable."); return env.BUCKET; }
 export const uid = () => crypto.randomUUID();
 export const now = () => new Date().toISOString();
 export class HttpError extends Error { constructor(public status:number, message:string) { super(message); } }

@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, index, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index, uniqueIndex, primaryKey } from "drizzle-orm/sqlite-core";
 export const settings = sqliteTable("settings", { key: text("key").primaryKey(), value: text("value").notNull() });
 export const folders = sqliteTable("folders", {
   id: text("id").primaryKey(), ownerId: text("ownerId").notNull(), name: text("name").notNull(),
@@ -41,4 +41,16 @@ export const profiles = sqliteTable("profiles", {
  website: text("website").notNull().default(""), bio: text("bio").notNull().default(""),
  photoKey: text("photoKey"), photoMime: text("photoMime"), photoVersion: text("photoVersion"),
  updatedAt: text("updatedAt").notNull(),
+});
+
+// Optional no-card attachment backend; file chunks stay below D1 row limits.
+export const fileObjects = sqliteTable("file_objects", {
+ key:text("key").primaryKey(), size:integer("size").notNull(), mime:text("mime").notNull(), createdAt:text("createdAt").notNull(),
+});
+export const fileChunks = sqliteTable("file_chunks", {
+ objectKey:text("objectKey").notNull().references(()=>fileObjects.key,{onDelete:"cascade"}),
+ ordinal:integer("ordinal").notNull(), data:text("data").notNull(),
+},t=>[primaryKey({columns:[t.objectKey,t.ordinal]})]);
+export const fileStorageUsage = sqliteTable("file_storage_usage", {
+ id:integer("id").primaryKey(), bytes:integer("bytes").notNull().default(0),
 });

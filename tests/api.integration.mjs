@@ -6,7 +6,8 @@ const require=createRequire(fs.realpathSync(new URL('../node_modules/wrangler/pa
 const {Miniflare}=require('miniflare');
 const base=new URL('../dist/server/',import.meta.url).pathname;
 const files=fs.readdirSync(base,{recursive:true}).filter(p=>p.endsWith('.js')).map(p=>({type:'ESModule',path:base+p}));
-const mf=new Miniflare({modules:[{type:'ESModule',path:base+'index.js'},...files.filter(p=>p.path!==base+'index.js')],compatibilityDate:'2026-05-15',compatibilityFlags:['nodejs_compat'],d1Databases:['DB'],r2Buckets:['BUCKET'],cf:false,bindings:{AUTH_MODE:'sites'}});
+const d1Files=process.env.TEST_FILE_STORAGE==='d1';
+const mf=new Miniflare({modules:[{type:'ESModule',path:base+'index.js'},...files.filter(p=>p.path!==base+'index.js')],compatibilityDate:'2026-05-15',compatibilityFlags:['nodejs_compat'],d1Databases:['DB'],r2Buckets:['BUCKET'],cf:false,bindings:{AUTH_MODE:'sites',FILE_STORAGE:d1Files?'d1':'r2'}});
 const identity=id=>({'oai-authenticated-user-id':id,'oai-authenticated-user-email':`${id}@example.test`});
 let checks=0;
 async function call(path,method='GET',payload,headers={},status=200){
@@ -20,7 +21,7 @@ async function call(path,method='GET',payload,headers={},status=200){
  return {data,response};
 }
 try{
- const db=await mf.getD1Database('DB');const bucket=await mf.getR2Bucket('BUCKET');
+ const db=await mf.getD1Database('DB');const bucket=d1Files?{get:key=>db.prepare('SELECT key FROM file_objects WHERE key=?').bind(key).first()}:await mf.getR2Bucket('BUCKET');
  const migrationDir=new URL('../drizzle/',import.meta.url);
  for(const name of fs.readdirSync(migrationDir).filter(name=>name.endsWith('.sql')).sort()){
   if(name.startsWith('0001_'))await db.prepare("INSERT INTO notes (id,ownerId,title,content,createdAt,updatedAt) VALUES ('legacy-note','legacy-owner','Kept title','Kept content','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')").run();
@@ -207,11 +208,31 @@ try{
  assert.equal((await db.prepare('SELECT COUNT(*) n FROM attachments').first()).n,0);
  assert.equal(await bucket.get(stored.storageKey),null,'Permanent deletion removes the R2 object');checks++;
  await call(`shared/${token2}`,'GET',undefined,{},404);
+ if(d1Files){
+  // Roundtrip the maximum attachment size across all chunks, not just tiny text.
+  const large=(await call('notes','POST',{title:'Chunked file test'},a,201)).data.note;
+  const bytes=new Uint8Array(5*1024*1024);for(let i=0;i<bytes.length;i++)bytes[i]=i%251;
+  const form=new FormData();form.append('file',new File([bytes],'large.pdf',{type:'application/pdf'}));
+  await call(`notes/${large.id}/attachments`,'POST',form,a,201);
+  const largeInfo=(await call(`notes/${large.id}`,'GET',undefined,a)).data;
+  const download=await mf.dispatchFetch(`https://test.local/api/files/${largeInfo.attachments[0].id}`,{headers:a});
+  assert.equal(download.status,200);assert.deepEqual(new Uint8Array(await download.arrayBuffer()),bytes);checks++;
+  const usage=await db.prepare('SELECT bytes FROM file_storage_usage WHERE id=1').first();
+  assert.equal(usage.bytes,bytes.length);checks++;
+  await db.prepare('UPDATE file_storage_usage SET bytes=104857600 WHERE id=1').run();
+  await call('profile/photo','POST',picture(),a,507);
+  assert.equal((await db.prepare('SELECT bytes FROM file_storage_usage WHERE id=1').first()).bytes,104857600,'Quota failure rolls back the complete write');checks++;
+  await db.prepare('UPDATE file_storage_usage SET bytes=? WHERE id=1').bind(usage.bytes).run();
+  await call(`notes/${large.id}`,'DELETE',undefined,a);
+  await call(`notes/${large.id}/purge`,'DELETE',undefined,a);
+  assert.equal((await db.prepare('SELECT COUNT(*) n FROM file_chunks').first()).n,0,'Permanent deletion removes every chunk');checks++;
+  assert.equal((await db.prepare('SELECT bytes FROM file_storage_usage WHERE id=1').first()).bytes,0);checks++;
+ }
  const expired=crypto.randomUUID(),old=new Date(Date.now()-91*86400000).toISOString();
  await db.prepare('INSERT INTO participants (id,consentVersion,device,language,createdAt,lastSeen) VALUES (?,?,?,?,?,?)').bind(expired,'test','Unknown','Unknown',old,old).run();
  await db.prepare('INSERT INTO events (id,participantId,kind,seconds,createdAt) VALUES (?,?,?,?,?)').bind(crypto.randomUUID(),expired,'page_view',0,old).run();
  await call('research/analytics','GET',undefined,a);
  assert.equal(await db.prepare('SELECT id FROM participants WHERE id=?').bind(expired).first(),null,'Expired research is purged');
  assert.equal((await db.prepare('SELECT COUNT(*) n FROM events').first()).n,0);checks++;
- console.log(`Passed ${checks} API and data-integrity checks using isolated test stores.`);
+ console.log(`Passed ${checks} API and data-integrity checks using isolated ${d1Files?"D1-file":"R2"} test stores.`);
 }finally{await mf.dispose();}

@@ -1,3 +1,4 @@
+import {FileStorageFullError} from "@/lib/d1-file-store";
 import {handleProfile} from "@/lib/profile";
 import { currentUser, authMode, authCookie, isResearchOwner } from "@/lib/auth";
 import { verifyFirebaseToken } from "@/lib/firebase-token";
@@ -186,6 +187,6 @@ async function handle(req:Request,context:Context):Promise<Response> {
       if(id==="model"&&method==="DELETE") {await admin();await db().prepare("DELETE FROM settings WHERE key='ml_model'").run();return json({ok:true});}
     }
     throw new HttpError(404,"Endpoint not found.");
-  }catch(e){if(e instanceof HttpError)return json({error:e.message},e.status);console.error("API request failed",e instanceof Error?e.message:"Unknown error");return json({error:"Something went wrong. Please try again."},500);}
+  }catch(e){if(e instanceof FileStorageFullError)return json({error:e.message},507);if(e instanceof HttpError)return json({error:e.message},e.status);console.error("API request failed",e instanceof Error?e.message:"Unknown error");return json({error:"Something went wrong. Please try again."},500);}
 }
 export const GET=handle;export const POST=handle;export const PATCH=handle;export const DELETE=handle;
